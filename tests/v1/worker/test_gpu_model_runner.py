@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from vllm.config import (
     AttentionConfig,
@@ -16,6 +17,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -535,6 +537,71 @@ def test_load_model_weights_inplace(dist_init, model_runner, model_runner_2):
 def test_reload_weights_before_load_model(model_runner):
     with pytest.raises(ValueError):
         model_runner.reload_weights()
+
+
+def test_apply_sparse_weight_patches_updates_only_selected_entries():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(6, dtype=torch.float32))
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = DummyModel()
+
+    runner.apply_sparse_weight_patches(
+        [
+            SparseWeightPatch(
+                name="weight",
+                indices=torch.tensor([1, 4], dtype=torch.int32),
+                values=torch.tensor([3.5, -2.0], dtype=torch.float32),
+            )
+        ]
+    )
+
+    expected = torch.tensor([0.0, 3.5, 0.0, 0.0, -2.0, 0.0], dtype=torch.float32)
+    assert torch.equal(runner.get_model().weight.data, expected)
+
+
+def test_apply_sparse_weight_patches_rejects_out_of_range_indices():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = DummyModel()
+
+    with pytest.raises(IndexError, match="must be within"):
+        runner.apply_sparse_weight_patches(
+            [
+                SparseWeightPatch(
+                    name="weight",
+                    indices=torch.tensor([4], dtype=torch.int32),
+                    values=torch.tensor([1.0], dtype=torch.float32),
+                )
+            ]
+        )
+
+
+def test_apply_sparse_weight_patches_rejects_non_contiguous_param():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.arange(12, dtype=torch.float32).view(3, 4).t())
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = DummyModel()
+
+    with pytest.raises(NotImplementedError, match="contiguous params"):
+        runner.apply_sparse_weight_patches(
+            [
+                SparseWeightPatch(
+                    name="weight",
+                    indices=torch.tensor([1], dtype=torch.int32),
+                    values=torch.tensor([1.0], dtype=torch.float32),
+                )
+            ]
+        )
 
 
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config):
