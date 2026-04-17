@@ -70,6 +70,10 @@ class IPCWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     """Base64-encoded pickled IPC handles, used for HTTP transport."""
 
     def __post_init__(self):
+        super().__post_init__()
+        if self.update_kind != "dense":
+            raise NotImplementedError("IPC weight transfer only supports dense updates")
+
         if self.ipc_handles_pickled is not None:
             if self.ipc_handles is not None:
                 raise ValueError(

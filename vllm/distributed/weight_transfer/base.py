@@ -5,7 +5,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from dataclasses import KW_ONLY, dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
@@ -33,6 +33,21 @@ class WeightTransferUpdateInfo(ABC):  # noqa: B024
     """Set to True if weights are in checkpoint/original model format and need
     layerwise processing. Set to False if weights have already been processed
     into kernel format (repacking, renaming, etc.)."""
+    update_kind: Literal["dense", "sparse_flat"] = "dense"
+    """Weight update format."""
+
+    def __post_init__(self) -> None:
+        if self.update_kind not in ("dense", "sparse_flat"):
+            raise ValueError(f"Unsupported update_kind: {self.update_kind}")
+
+
+@dataclass
+class SparseWeightPatch:
+    """A sparse in-place patch for one existing parameter."""
+
+    name: str
+    indices: torch.Tensor
+    values: torch.Tensor
 
 
 # API-level request classes (accept dicts for backend-agnostic serialization)

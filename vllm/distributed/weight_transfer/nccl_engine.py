@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
+    SparseWeightPatch,
     WeightTransferEngine,
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
@@ -68,6 +69,8 @@ class NCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]
+    nnz_list: list[int] | None = None
+    indices_dtype_name: str | None = None
     packed: bool = False
     """Whether to use packed tensor broadcasting for efficiency.
     When True, multiple tensors are batched together before broadcasting
@@ -81,6 +84,7 @@ class NCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
 
     def __post_init__(self):
         """Validate that all lists have the same length."""
+        super().__post_init__()
         num_params = len(self.names)
         if len(self.dtype_names) != num_params:
             raise ValueError(
@@ -91,6 +95,34 @@ class NCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
             raise ValueError(
                 f"`shapes` should be of the same size as `names`: "
                 f"got {len(self.shapes)} and {len(self.names)}"
+            )
+        if self.update_kind == "dense":
+            if self.nnz_list is not None or self.indices_dtype_name is not None:
+                raise ValueError(
+                    "Sparse metadata is only supported for `update_kind='sparse_flat'`"
+                )
+            return
+
+        if self.is_checkpoint_format:
+            raise ValueError(
+                "`update_kind='sparse_flat'` requires `is_checkpoint_format=False`"
+            )
+        if self.packed:
+            raise ValueError(
+                "`update_kind='sparse_flat'` cannot be combined with `packed=True`"
+            )
+        if self.nnz_list is None:
+            raise ValueError("`nnz_list` is required for sparse updates")
+        if len(self.nnz_list) != num_params:
+            raise ValueError(
+                f"`nnz_list` should be of the same size as `names`: "
+                f"got {len(self.nnz_list)} and {len(self.names)}"
+            )
+        if any(nnz < 0 for nnz in self.nnz_list):
+            raise ValueError("Sparse `nnz_list` entries must be non-negative")
+        if self.indices_dtype_name != "int32":
+            raise ValueError(
+                "`indices_dtype_name='int32'` is required for sparse updates"
             )
 
 
@@ -174,6 +206,11 @@ class NCCLWeightTransferEngine(
                 "NCCL weight transfer not initialized. "
                 "Call init_transfer_engine() first."
             )
+        if update_info.update_kind != "dense":
+            raise ValueError(
+                "Sparse updates must use `receive_sparse_weights`, not "
+                "`receive_weights`"
+            )
 
         if update_info.packed:
             # Build iterator of (name, (shape, dtype)) from update_info
@@ -204,6 +241,43 @@ class NCCLWeightTransferEngine(
                 )
                 load_weights([(name, weight)])
                 del weight
+
+    def receive_sparse_weights(
+        self,
+        update_info: NCCLWeightTransferUpdateInfo,
+        apply_patches: Callable[[list[SparseWeightPatch]], None],
+    ) -> None:
+        """Receive sparse flat-index patches from trainer via NCCL."""
+        if self.model_update_group is None:
+            raise RuntimeError(
+                "NCCL weight transfer not initialized. "
+                "Call init_transfer_engine() first."
+            )
+        if update_info.update_kind != "sparse_flat":
+            raise ValueError("Sparse receive path requires `update_kind='sparse_flat'`")
+        assert update_info.nnz_list is not None
+        assert update_info.indices_dtype_name is not None
+
+        indices_dtype = getattr(torch, update_info.indices_dtype_name)
+        for name, dtype_name, nnz in zip(
+            update_info.names,
+            update_info.dtype_names,
+            update_info.nnz_list,
+        ):
+            dtype = getattr(torch, dtype_name)
+            indices = torch.empty(nnz, dtype=indices_dtype, device="cuda")
+            values = torch.empty(nnz, dtype=dtype, device="cuda")
+            self.model_update_group.broadcast(
+                indices, src=0, stream=torch.cuda.current_stream()
+            )
+            self.model_update_group.broadcast(
+                values, src=0, stream=torch.cuda.current_stream()
+            )
+            apply_patches(
+                [SparseWeightPatch(name=name, indices=indices, values=values)]
+            )
+            del indices
+            del values
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:
@@ -267,6 +341,27 @@ class NCCLWeightTransferEngine(
                     src=args.src,
                     stream=args.stream or torch.cuda.current_stream(),
                 )
+
+    @staticmethod
+    def trainer_send_sparse_weights(
+        iterator: Iterator[SparseWeightPatch],
+        trainer_args: dict[str, Any] | NCCLTrainerSendWeightsArgs,
+    ) -> None:
+        """Broadcast sparse flat-index patches from trainer to vLLM workers."""
+        if isinstance(trainer_args, dict):
+            args = NCCLTrainerSendWeightsArgs(**trainer_args)
+        else:
+            args = trainer_args
+
+        if args.packed:
+            raise ValueError(
+                "Sparse NCCL updates cannot be combined with `packed=True`"
+            )
+
+        stream = args.stream or torch.cuda.current_stream()
+        for patch in iterator:
+            args.group.broadcast(patch.indices, src=args.src, stream=stream)
+            args.group.broadcast(patch.values, src=args.src, stream=stream)
 
     @staticmethod
     def trainer_init(
