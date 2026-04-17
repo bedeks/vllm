@@ -99,3 +99,24 @@ def test_update_weights_sparse_rejects_tp_or_pp(monkeypatch):
                 "update_kind": "sparse_flat",
             },
         )
+
+
+def test_debug_get_weight_slice_digest_delegates_to_model_runner():
+    worker = object.__new__(Worker)
+    worker.model_runner = SimpleNamespace(
+        get_weight_slice_digest=lambda **kwargs: {"digest": "abc", **kwargs},
+    )
+
+    digest_info = Worker.debug_get_weight_slice_digest(
+        worker,
+        name="layer.weight",
+        flat_start=5,
+        flat_length=7,
+    )
+
+    assert digest_info == {
+        "digest": "abc",
+        "name": "layer.weight",
+        "flat_start": 5,
+        "flat_length": 7,
+    }

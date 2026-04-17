@@ -4,6 +4,8 @@
 from types import SimpleNamespace
 
 import numpy as np
+import hashlib
+
 import pytest
 import torch
 import torch.nn as nn
@@ -601,6 +603,48 @@ def test_apply_sparse_weight_patches_rejects_non_contiguous_param():
                     values=torch.tensor([1.0], dtype=torch.float32),
                 )
             ]
+        )
+
+
+def test_get_weight_slice_digest_matches_expected_slice():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.arange(8, dtype=torch.bfloat16))
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = DummyModel()
+
+    digest_info = runner.get_weight_slice_digest(
+        name="weight",
+        flat_start=2,
+        flat_length=3,
+    )
+
+    expected_slice = torch.arange(2, 5, dtype=torch.float32).numpy().tobytes()
+    expected_digest = hashlib.sha256(expected_slice).hexdigest()
+
+    assert digest_info["name"] == "weight"
+    assert digest_info["flat_start"] == 2
+    assert digest_info["flat_length"] == 3
+    assert digest_info["param_numel"] == 8
+    assert digest_info["digest"] == expected_digest
+
+
+def test_get_weight_slice_digest_rejects_out_of_range_slice():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = DummyModel()
+
+    with pytest.raises(IndexError, match="outside the parameter range"):
+        runner.get_weight_slice_digest(
+            name="weight",
+            flat_start=3,
+            flat_length=2,
         )
 
 

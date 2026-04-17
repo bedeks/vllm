@@ -1021,6 +1021,19 @@ class Worker(WorkerBase):
         # Sync here so the next step uses the new weights.
         torch.accelerator.synchronize()
 
+    def debug_get_weight_slice_digest(
+        self,
+        name: str,
+        flat_start: int,
+        flat_length: int,
+    ) -> dict[str, Any]:
+        """Return a stable digest for a flattened parameter slice."""
+        return self.model_runner.get_weight_slice_digest(
+            name=name,
+            flat_start=flat_start,
+            flat_length=flat_length,
+        )
+
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

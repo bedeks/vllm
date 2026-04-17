@@ -166,6 +166,56 @@ async def get_world_size(
     return JSONResponse(content={"world_size": world_size})
 
 
+@router.post("/debug/get_weight_slice_digest")
+async def get_weight_slice_digest(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+
+    name = body.get("name")
+    flat_start = body.get("flat_start")
+    flat_length = body.get("flat_length")
+
+    if not isinstance(name, str):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Missing or invalid 'name' in request body",
+        )
+    if not isinstance(flat_start, int):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Missing or invalid 'flat_start' in request body",
+        )
+    if not isinstance(flat_length, int):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Missing or invalid 'flat_length' in request body",
+        )
+
+    replies = await engine_client(raw_request).collective_rpc(
+        "debug_get_weight_slice_digest",
+        kwargs={
+            "name": name,
+            "flat_start": flat_start,
+            "flat_length": flat_length,
+        },
+    )
+    if not replies:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="No worker replies received",
+        )
+    first_reply = replies[0]
+    if any(reply != first_reply for reply in replies[1:]):
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="Worker replies disagreed on the weight slice digest",
+        )
+
+    return JSONResponse(content=first_reply)
+
+
 def attach_router(app: FastAPI):
     if not envs.VLLM_SERVER_DEV_MODE:
         return

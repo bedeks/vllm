@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import hashlib
 import itertools
 import threading
 import time
@@ -3057,6 +3058,44 @@ class GPUModelRunner(
                 patch.indices.to(device=flat_param.device, dtype=torch.long),
                 patch.values,
             )
+
+    def get_weight_slice_digest(
+        self,
+        name: str,
+        flat_start: int,
+        flat_length: int,
+    ) -> dict[str, Any]:
+        """Return a stable digest for a flattened parameter slice."""
+        if flat_start < 0:
+            raise ValueError("`flat_start` must be non-negative")
+        if flat_length < 0:
+            raise ValueError("`flat_length` must be non-negative")
+
+        model = self.get_model()
+        param = model.get_parameter(name)
+        flat_param = param.data.reshape(-1)
+
+        flat_stop = flat_start + flat_length
+        if flat_stop > flat_param.numel():
+            raise IndexError(
+                f"Requested slice [{flat_start}, {flat_stop}) is outside "
+                f"the parameter range [0, {flat_param.numel()}) for {name}"
+            )
+
+        slice_tensor = flat_param.narrow(0, flat_start, flat_length)
+        slice_bytes = slice_tensor.to(
+            device="cpu",
+            dtype=torch.float32,
+        ).numpy().tobytes()
+
+        return {
+            "name": name,
+            "flat_start": flat_start,
+            "flat_length": flat_length,
+            "param_numel": flat_param.numel(),
+            "dtype": str(param.dtype),
+            "digest": hashlib.sha256(slice_bytes).hexdigest(),
+        }
 
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
