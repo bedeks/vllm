@@ -1034,6 +1034,13 @@ class Worker(WorkerBase):
             flat_length=flat_length,
         )
 
+    def debug_get_weight_digest_map(
+        self,
+        names: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Return stable digests for one or more model parameters."""
+        return self.model_runner.get_weight_digest_map(names=names)
+
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

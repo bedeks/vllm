@@ -648,6 +648,27 @@ def test_get_weight_slice_digest_rejects_out_of_range_slice():
         )
 
 
+def test_get_weight_digest_map_matches_expected_digests():
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = nn.Parameter(torch.arange(4, dtype=torch.float32))
+            self.second = nn.Parameter(torch.tensor([5.0, -1.0], dtype=torch.float32))
+
+    runner = object.__new__(GPUModelRunner)
+    runner.model = DummyModel()
+
+    digest_map = runner.get_weight_digest_map()
+
+    expected = {}
+    for name, param in runner.get_model().named_parameters():
+        expected[name] = hashlib.sha256(
+            param.data.reshape(-1).contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+
+    assert digest_map == expected
+
+
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config):
     torch.set_default_dtype(torch.float16)
     layer_0 = "model.layers.0.self_attn.attn"

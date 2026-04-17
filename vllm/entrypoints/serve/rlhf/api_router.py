@@ -216,6 +216,41 @@ async def get_weight_slice_digest(raw_request: Request):
     return JSONResponse(content=first_reply)
 
 
+@router.post("/debug/get_weight_digest_map")
+async def get_weight_digest_map(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+
+    names = body.get("names")
+    if names is not None and (
+        not isinstance(names, list) or not all(isinstance(name, str) for name in names)
+    ):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Invalid 'names' in request body; expected a list of strings",
+        )
+
+    replies = await engine_client(raw_request).collective_rpc(
+        "debug_get_weight_digest_map",
+        kwargs={"names": names},
+    )
+    if not replies:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="No worker replies received",
+        )
+    first_reply = replies[0]
+    if any(reply != first_reply for reply in replies[1:]):
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="Worker replies disagreed on the weight digest map",
+        )
+
+    return JSONResponse(content={"digests": first_reply})
+
+
 def attach_router(app: FastAPI):
     if not envs.VLLM_SERVER_DEV_MODE:
         return

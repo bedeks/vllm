@@ -3097,6 +3097,25 @@ class GPUModelRunner(
             "digest": hashlib.sha256(slice_bytes).hexdigest(),
         }
 
+    def get_weight_digest_map(
+        self,
+        names: Sequence[str] | None = None,
+    ) -> dict[str, str]:
+        """Return stable digests for one or more model parameters."""
+        model = self.get_model()
+        if names is None:
+            names = sorted(name for name, _ in model.named_parameters())
+
+        digests: dict[str, str] = {}
+        for name in names:
+            param = model.get_parameter(name)
+            cpu_tensor = param.data.reshape(-1).contiguous().to(device="cpu")
+            digests[name] = hashlib.sha256(
+                cpu_tensor.view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+
+        return digests
+
     def get_supported_generation_tasks(self) -> list[GenerationTask]:
         model = self.get_model()
         supported_tasks = list[GenerationTask]()
