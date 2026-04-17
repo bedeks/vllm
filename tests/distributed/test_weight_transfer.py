@@ -18,6 +18,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+from vllm.distributed.weight_transfer.base import SparseWeightPatch
 from vllm.distributed.weight_transfer.ipc_engine import (
     IPCWeightTransferEngine,
     IPCWeightTransferInitInfo,
@@ -88,6 +89,78 @@ class TestNCCLWeightTransferUpdateInfoValidation:
             shapes=[],
         )
         assert len(info.names) == 0
+
+    def test_valid_sparse_update_info(self):
+        """Test creating valid sparse NCCL update info."""
+        info = NCCLWeightTransferUpdateInfo(
+            names=["layer.weight", "layer.bias"],
+            dtype_names=["float32", "bfloat16"],
+            shapes=[[10, 10], [10]],
+            nnz_list=[4, 2],
+            indices_dtype_name="int32",
+            is_checkpoint_format=False,
+            update_kind="sparse_flat",
+        )
+        assert info.update_kind == "sparse_flat"
+        assert info.nnz_list == [4, 2]
+        assert info.indices_dtype_name == "int32"
+
+    def test_sparse_update_requires_nnz_list(self):
+        with pytest.raises(ValueError, match="`nnz_list` is required"):
+            NCCLWeightTransferUpdateInfo(
+                names=["layer.weight"],
+                dtype_names=["float32"],
+                shapes=[[10, 10]],
+                indices_dtype_name="int32",
+                is_checkpoint_format=False,
+                update_kind="sparse_flat",
+            )
+
+    def test_sparse_update_rejects_checkpoint_format(self):
+        with pytest.raises(ValueError, match="is_checkpoint_format=False"):
+            NCCLWeightTransferUpdateInfo(
+                names=["layer.weight"],
+                dtype_names=["float32"],
+                shapes=[[10, 10]],
+                nnz_list=[3],
+                indices_dtype_name="int32",
+                update_kind="sparse_flat",
+            )
+
+    def test_sparse_update_rejects_packed(self):
+        with pytest.raises(ValueError, match="cannot be combined with `packed=True`"):
+            NCCLWeightTransferUpdateInfo(
+                names=["layer.weight"],
+                dtype_names=["float32"],
+                shapes=[[10, 10]],
+                nnz_list=[3],
+                indices_dtype_name="int32",
+                is_checkpoint_format=False,
+                update_kind="sparse_flat",
+                packed=True,
+            )
+
+    def test_sparse_update_rejects_non_int32_indices(self):
+        with pytest.raises(ValueError, match="indices_dtype_name='int32'"):
+            NCCLWeightTransferUpdateInfo(
+                names=["layer.weight"],
+                dtype_names=["float32"],
+                shapes=[[10, 10]],
+                nnz_list=[3],
+                indices_dtype_name="int64",
+                is_checkpoint_format=False,
+                update_kind="sparse_flat",
+            )
+
+    def test_dense_update_rejects_sparse_metadata(self):
+        with pytest.raises(ValueError, match="Sparse metadata"):
+            NCCLWeightTransferUpdateInfo(
+                names=["layer.weight"],
+                dtype_names=["float32"],
+                shapes=[[10, 10]],
+                nnz_list=[3],
+                indices_dtype_name="int32",
+            )
 
 
 # --- Unit Tests: Engine Parsing ---
@@ -219,6 +292,29 @@ def test_nccl_receive_weights_without_init_raises():
 
     with pytest.raises(RuntimeError, match="not initialized"):
         engine.receive_weights(update_info, lambda x: None)
+
+
+def test_nccl_receive_sparse_weights_without_init_raises():
+    """Test that sparse receive raises if init_transfer_engine wasn't called."""
+    if torch.accelerator.device_count() < 1:
+        pytest.skip("Need at least 1 GPU for this test")
+
+    config = WeightTransferConfig(backend="nccl")
+    parallel_config = create_mock_parallel_config()
+    engine = NCCLWeightTransferEngine(config, parallel_config)
+
+    update_info = NCCLWeightTransferUpdateInfo(
+        names=["w"],
+        dtype_names=["float32"],
+        shapes=[[10]],
+        nnz_list=[2],
+        indices_dtype_name="int32",
+        is_checkpoint_format=False,
+        update_kind="sparse_flat",
+    )
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        engine.receive_sparse_weights(update_info, lambda x: None)
 
 
 # --- Integration Test: NCCL Weight Transfer Between Ray Tasks ---
@@ -376,6 +472,138 @@ def test_nccl_weight_transfer_between_processes():
     )
 
 
+@ray.remote(num_gpus=1)
+def trainer_broadcast_sparse_tensor(
+    master_address: str,
+    master_port: int,
+    world_size: int,
+) -> bool:
+    """Trainer task that broadcasts sparse patches via NCCL."""
+    import torch
+
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.weight_transfer.base import SparseWeightPatch
+    from vllm.distributed.weight_transfer.nccl_engine import (
+        NCCLTrainerSendWeightsArgs,
+        NCCLWeightTransferEngine,
+    )
+
+    pg = StatelessProcessGroup.create(
+        host=master_address,
+        port=master_port,
+        rank=0,
+        world_size=world_size,
+    )
+    comm = PyNcclCommunicator(pg, device=0)
+
+    patch = SparseWeightPatch(
+        name="test.weight",
+        indices=torch.tensor([1, 7, 25], dtype=torch.int32, device="cuda:0"),
+        values=torch.tensor([10.0, 20.0, 30.0], dtype=torch.float32, device="cuda:0"),
+    )
+    NCCLWeightTransferEngine.trainer_send_sparse_weights(
+        iter([patch]),
+        NCCLTrainerSendWeightsArgs(group=comm),
+    )
+    torch.accelerator.synchronize()
+    return True
+
+
+@ray.remote(num_gpus=1)
+def inference_receive_sparse_tensor(
+    master_address: str,
+    master_port: int,
+    world_size: int,
+) -> dict:
+    """Inference task that receives sparse patches via NCCLWeightTransferEngine."""
+    from unittest.mock import MagicMock
+
+    import torch
+
+    from vllm.config.parallel import ParallelConfig
+    from vllm.config.weight_transfer import WeightTransferConfig
+    from vllm.distributed.weight_transfer.nccl_engine import (
+        NCCLWeightTransferEngine,
+        NCCLWeightTransferInitInfo,
+        NCCLWeightTransferUpdateInfo,
+    )
+
+    config = WeightTransferConfig(backend="nccl")
+    parallel_config = MagicMock(spec=ParallelConfig)
+    parallel_config.rank = 0
+    parallel_config.world_size = 1
+    parallel_config.data_parallel_rank = 0
+    parallel_config.data_parallel_index = 0
+
+    engine = NCCLWeightTransferEngine(config, parallel_config)
+    engine.init_transfer_engine(
+        NCCLWeightTransferInitInfo(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=1,
+            world_size=world_size,
+        )
+    )
+
+    target = torch.zeros(30, dtype=torch.float32, device="cuda")
+
+    def apply_sparse_patches(patches: list[SparseWeightPatch]):
+        for patch in patches:
+            target.index_copy_(0, patch.indices.to(torch.long), patch.values)
+
+    update_info = NCCLWeightTransferUpdateInfo(
+        names=["test.weight"],
+        dtype_names=["float32"],
+        shapes=[[30]],
+        nnz_list=[3],
+        indices_dtype_name="int32",
+        is_checkpoint_format=False,
+        update_kind="sparse_flat",
+    )
+    engine.receive_sparse_weights(update_info, apply_sparse_patches)
+    torch.accelerator.synchronize()
+
+    expected = torch.zeros(30, dtype=torch.float32, device="cuda")
+    expected[[1, 7, 25]] = torch.tensor(
+        [10.0, 20.0, 30.0], dtype=torch.float32, device="cuda"
+    )
+    success = torch.equal(target, expected)
+    engine.shutdown()
+    return {
+        "success": success,
+        "selected_values": target[[1, 7, 25]].cpu().tolist(),
+    }
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2,
+    reason="Need at least 2 GPUs to run NCCL sparse weight transfer test.",
+)
+def test_nccl_sparse_weight_transfer_between_processes():
+    """Test NCCL sparse weight transfer from trainer to inference process."""
+    ray.init(ignore_reinit_error=True)
+
+    master_address = "127.0.0.1"
+    master_port = get_open_port()
+    world_size = 2
+
+    inference_future = inference_receive_sparse_tensor.remote(
+        master_address, master_port, world_size
+    )
+    trainer_future = trainer_broadcast_sparse_tensor.remote(
+        master_address, master_port, world_size
+    )
+
+    trainer_result, result = ray.get([trainer_future, inference_future])
+
+    assert trainer_result, "Trainer should complete successfully"
+    assert result["success"], (
+        "Sparse weight transfer failed. "
+        f"Received selected values: {result['selected_values']}"
+    )
+
+
 # --- Unit Tests: IPCWeightTransferUpdateInfo Validation ---
 
 
@@ -456,6 +684,25 @@ class TestIPCWeightTransferUpdateInfoValidation:
                 dtype_names=["float32", "float32"],
                 shapes=[[10, 10], [10]],
                 ipc_handles=ipc_handles,
+            )
+
+    def test_sparse_update_kind_rejected(self):
+        """Test that IPC backend rejects sparse update metadata."""
+        if torch.accelerator.device_count() < 1:
+            pytest.skip("Need at least 1 GPU for this test")
+
+        dummy_tensor = torch.ones(10, 10, device="cuda:0")
+        ipc_handle = reduce_tensor(dummy_tensor)
+        gpu_uuid = str(torch.cuda.get_device_properties(0).uuid)
+        ipc_handles = [{gpu_uuid: ipc_handle}]
+
+        with pytest.raises(NotImplementedError, match="dense updates"):
+            IPCWeightTransferUpdateInfo(
+                names=["layer.weight"],
+                dtype_names=["float32"],
+                shapes=[[10, 10]],
+                ipc_handles=ipc_handles,
+                update_kind="sparse_flat",
             )
 
     def test_valid_update_info_from_pickled(self, monkeypatch):
