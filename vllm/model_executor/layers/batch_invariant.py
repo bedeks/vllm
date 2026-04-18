@@ -990,10 +990,6 @@ def enable_batch_invariant_mode():
 def override_envs_for_invariance(
     attention_backend: AttentionBackendEnum | None,
 ):
-    decode_invariant_backends = [
-        AttentionBackendEnum.FLASH_ATTN,  # best supported backend
-        AttentionBackendEnum.TRITON_ATTN,
-    ]
     backend_class = None
     if attention_backend is not None:
         try:
@@ -1015,16 +1011,6 @@ def override_envs_for_invariance(
                 "one of the supported backends before enabling batch_invariant."
             )
             raise RuntimeError(error)
-    if (
-        attention_backend is not None
-        and backend_class is not None
-        and attention_backend not in decode_invariant_backends
-    ):
-        warning = (
-            "You are using a non-decode-invariant form of batch invariance. "
-            "This will not be invariant between prefill and decode."
-        )
-        logger.warning_once(warning, scope="local")
     os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"

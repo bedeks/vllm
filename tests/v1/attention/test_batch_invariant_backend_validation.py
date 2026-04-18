@@ -9,6 +9,7 @@ import torch
 
 import vllm.config as config
 import vllm.envs as envs
+import vllm.v1.attention.selector as selector
 from vllm.model_executor.layers.batch_invariant import override_envs_for_invariance
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -71,6 +72,12 @@ class BatchInvariantBackend(NonBatchInvariantBackend):
     @classmethod
     def supports_batch_invariance(cls) -> bool:
         return True
+
+
+class NonDecodeInvariantBatchBackend(BatchInvariantBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "FLASH_ATTN_MLA"
 
 
 def test_validate_configuration_rejects_batch_invariant_unsupported_backend():
@@ -144,6 +151,48 @@ def test_get_attn_backend_threads_batch_invariance(monkeypatch):
 
     assert captured["config"].is_batch_invariant is True
     assert backend.get_name() == "TRITON_ATTN"
+
+
+def test_get_attn_backend_warns_for_auto_selected_non_decode_invariant_backend(
+    monkeypatch,
+):
+    _cached_get_attn_backend.cache_clear()
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(
+        config,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            cache_config=None,
+            speculative_config=None,
+            attention_config=SimpleNamespace(backend=None),
+        ),
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_attn_backend_cls",
+        lambda backend,
+        attn_selector_config,
+        num_heads=None: "tests.v1.attention.test_batch_invariant_backend_validation"
+        ".NonDecodeInvariantBatchBackend",
+    )
+    warnings = []
+    monkeypatch.setattr(
+        selector.logger,
+        "warning_once",
+        lambda message, scope=None: warnings.append((message, scope)),
+    )
+
+    backend = get_attn_backend(64, torch.float16, None)
+
+    assert backend.get_name() == "FLASH_ATTN_MLA"
+    assert warnings == [
+        (
+            "You are using a non-decode-invariant form of batch invariance. "
+            "This will not be invariant between prefill and decode.",
+            "local",
+        )
+    ]
 
 
 def test_override_envs_for_invariance_allows_auto_selected_backend():
