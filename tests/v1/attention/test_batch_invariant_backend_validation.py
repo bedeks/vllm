@@ -162,6 +162,35 @@ def test_override_envs_for_invariance_allows_auto_selected_backend():
                 os.environ[key] = value
 
 
-def test_override_envs_for_invariance_rejects_unsupported_backend():
+def test_override_envs_for_invariance_uses_backend_capability(monkeypatch):
+    original_env = {key: os.environ.get(key) for key in BATCH_INVARIANT_ENV_KEYS}
+    original_get_class = AttentionBackendEnum.get_class
+
+    def fake_get_class(self):
+        if self == AttentionBackendEnum.FLASHINFER:
+            return BatchInvariantBackend
+        return original_get_class(self)
+
+    monkeypatch.setattr(AttentionBackendEnum, "get_class", fake_get_class)
+
+    try:
+        override_envs_for_invariance(AttentionBackendEnum.FLASHINFER)
+
+        assert os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] == "0"
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_override_envs_for_invariance_rejects_unsupported_backend(monkeypatch):
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda self: NonBatchInvariantBackend,
+    )
+
     with pytest.raises(RuntimeError, match="requires an attention backend"):
         override_envs_for_invariance(AttentionBackendEnum.FLASHINFER)

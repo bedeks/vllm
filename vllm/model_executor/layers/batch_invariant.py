@@ -994,29 +994,30 @@ def override_envs_for_invariance(
         AttentionBackendEnum.FLASH_ATTN,  # best supported backend
         AttentionBackendEnum.TRITON_ATTN,
     ]
-    supported_backends = decode_invariant_backends + [
-        # FlashInfer temporarily disabled due to invariant CTA sizes.
-        # See FlashInfer issue #2424
-        # AttentionBackendEnum.FLASHINFER,
-        AttentionBackendEnum.FLASH_ATTN_MLA,
-        AttentionBackendEnum.TRITON_MLA,
-        # Not yet supported MLA backends
-        # AttentionBackendEnum.FLASHMLA,
-        # AttentionBackendEnum.FLEX_ATTENTION,  # IMA issue
-        # AttentionBackendEnum.FLASHINFER_MLA,  # PR #28967
-    ]
-    if attention_backend is not None and attention_backend not in supported_backends:
-        supported_names = [b.name for b in supported_backends]
-        backend_name = attention_backend.name if attention_backend else None
-        error = (
-            "VLLM batch_invariant mode requires an attention backend in "
-            f"{supported_names}, but got '{backend_name}'. "
-            "Please use --attention-backend or attention_config to set "
-            "one of the supported backends before enabling batch_invariant."
-        )
-        raise RuntimeError(error)
+    backend_class = None
+    if attention_backend is not None:
+        try:
+            backend_class = attention_backend.get_class()
+        except ImportError:
+            backend_class = None
+        if backend_class is not None and not backend_class.supports_batch_invariance():
+            supported_names = []
+            for backend in AttentionBackendEnum:
+                try:
+                    if backend.get_class().supports_batch_invariance():
+                        supported_names.append(backend.name)
+                except ImportError:
+                    continue
+            error = (
+                "VLLM batch_invariant mode requires an attention backend in "
+                f"{supported_names}, but got '{attention_backend.name}'. "
+                "Please use --attention-backend or attention_config to set "
+                "one of the supported backends before enabling batch_invariant."
+            )
+            raise RuntimeError(error)
     if (
         attention_backend is not None
+        and backend_class is not None
         and attention_backend not in decode_invariant_backends
     ):
         warning = (
