@@ -2,14 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm.config as config
+import vllm.envs as envs
 from vllm.model_executor.layers.batch_invariant import override_envs_for_invariance
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionBackend, AttentionImpl, AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -104,6 +109,41 @@ def test_validate_configuration_accepts_batch_invariant_supported_backend():
     )
 
     assert invalid_reasons == []
+
+
+def test_get_attn_backend_threads_batch_invariance(monkeypatch):
+    _cached_get_attn_backend.cache_clear()
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    monkeypatch.setattr(
+        config,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            cache_config=None,
+            speculative_config=None,
+            attention_config=SimpleNamespace(backend=None),
+        ),
+    )
+    captured = {}
+
+    def fake_get_attn_backend_cls(
+        backend,
+        attn_selector_config,
+        num_heads=None,
+    ):
+        captured["config"] = attn_selector_config
+        return AttentionBackendEnum.TRITON_ATTN.get_path()
+
+    monkeypatch.setattr(
+        current_platform,
+        "get_attn_backend_cls",
+        fake_get_attn_backend_cls,
+    )
+
+    backend = get_attn_backend(64, torch.float16, None)
+
+    assert captured["config"].is_batch_invariant is True
+    assert backend.get_name() == "TRITON_ATTN"
 
 
 def test_override_envs_for_invariance_allows_auto_selected_backend():
