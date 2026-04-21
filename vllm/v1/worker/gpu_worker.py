@@ -971,25 +971,7 @@ class Worker(WorkerBase):
         # Parse dict into backend-specific typed dataclass
         typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
 
-        if typed_update_info.update_kind == "sparse_flat":
-            if self.parallel_config.world_size != 1:
-                raise NotImplementedError(
-                    "Sparse weight updates currently require TP=1 and PP=1"
-                )
-            receive_sparse_weights = getattr(
-                self.weight_transfer_engine, "receive_sparse_weights", None
-            )
-            if receive_sparse_weights is None:
-                raise NotImplementedError(
-                    "Sparse weight updates are only implemented for the NCCL "
-                    "weight transfer backend"
-                )
-
-            receive_sparse_weights(
-                typed_update_info,
-                apply_patches=self.model_runner.apply_sparse_weight_patches,
-            )
-        elif typed_update_info.is_checkpoint_format:
+        if typed_update_info.is_checkpoint_format:
             model = self.model_runner.model
             from vllm.model_executor.model_loader.reload import (
                 finalize_layerwise_reload,
@@ -1005,20 +987,30 @@ class Worker(WorkerBase):
                 )
                 finalize_layerwise_reload(model, self.model_config)
         else:
-            model = self.model_runner.model
+            if typed_update_info.update_kind == "sparse_flat":
+                if self.parallel_config.world_size != 1:
+                    raise NotImplementedError(
+                        "Sparse weight updates currently require TP=1 and PP=1"
+                    )
+                self.weight_transfer_engine.receive_sparse_weights(
+                    typed_update_info,
+                    apply_patches=self.model_runner.apply_sparse_weight_patches,
+                )
+            else:
+                model = self.model_runner.model
 
-            # Weights are already in kernel format, copy directly
-            def load_weights_direct(
-                weights: list[tuple[str, torch.Tensor]],
-            ) -> None:
-                for name, weight in weights:
-                    param = model.get_parameter(name)
-                    param.copy_(weight)
+                # Weights are already in kernel format, copy directly
+                def load_weights_direct(
+                    weights: list[tuple[str, torch.Tensor]],
+                ) -> None:
+                    for name, weight in weights:
+                        param = model.get_parameter(name)
+                        param.copy_(weight)
 
-            self.weight_transfer_engine.receive_weights(
-                typed_update_info,
-                load_weights=load_weights_direct,
-            )
+                self.weight_transfer_engine.receive_weights(
+                    typed_update_info,
+                    load_weights=load_weights_direct,
+                )
 
         # NCCL broadcast/packed path are asynchronous.
         # Sync here so the next step uses the new weights.
