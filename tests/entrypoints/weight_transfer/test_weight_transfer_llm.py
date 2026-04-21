@@ -48,8 +48,7 @@ class MockUpdateInfo(WeightTransferUpdateInfo):
     names: list[str] | None = None
     dtype_names: list[str] | None = None
     shapes: list[list[int]] | None = None
-    nnz_list: list[int] | None = None
-    indices_dtype_name: str | None = None
+    num_updates_list: list[int] | None = None
 
 
 class MockWeightTransferEngine(WeightTransferEngine[MockInitInfo, MockUpdateInfo]):
@@ -272,8 +271,7 @@ def test_update_weights_passes_sparse_metadata():
                     "names": ["layer.weight"],
                     "dtype_names": ["bfloat16"],
                     "shapes": [[100]],
-                    "nnz_list": [3],
-                    "indices_dtype_name": "int32",
+                    "num_updates_list": [3],
                     "is_checkpoint_format": False,
                     "update_kind": "sparse_flat",
                 }
@@ -287,14 +285,13 @@ def test_update_weights_passes_sparse_metadata():
             info = engine.last_update_info
             return (
                 info.update_kind,
-                info.nnz_list,
-                info.indices_dtype_name,
+                info.num_updates_list,
                 info.is_checkpoint_format,
             )
 
         results = llm.collective_rpc(check_sparse_update_called)
         for result in results:
-            assert result == ("sparse_flat", [3], "int32", False)
+            assert result == ("sparse_flat", [3], False)
 
 
 @create_new_process_for_each_test()

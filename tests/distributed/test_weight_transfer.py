@@ -96,22 +96,19 @@ class TestNCCLWeightTransferUpdateInfoValidation:
             names=["layer.weight", "layer.bias"],
             dtype_names=["float32", "bfloat16"],
             shapes=[[10, 10], [10]],
-            nnz_list=[4, 2],
-            indices_dtype_name="int32",
+            num_updates_list=[4, 2],
             is_checkpoint_format=False,
             update_kind="sparse_flat",
         )
         assert info.update_kind == "sparse_flat"
-        assert info.nnz_list == [4, 2]
-        assert info.indices_dtype_name == "int32"
+        assert info.num_updates_list == [4, 2]
 
-    def test_sparse_update_requires_nnz_list(self):
-        with pytest.raises(ValueError, match="`nnz_list` is required"):
+    def test_sparse_update_requires_num_updates_list(self):
+        with pytest.raises(ValueError, match="`num_updates_list` is required"):
             NCCLWeightTransferUpdateInfo(
                 names=["layer.weight"],
                 dtype_names=["float32"],
                 shapes=[[10, 10]],
-                indices_dtype_name="int32",
                 is_checkpoint_format=False,
                 update_kind="sparse_flat",
             )
@@ -122,8 +119,7 @@ class TestNCCLWeightTransferUpdateInfoValidation:
                 names=["layer.weight"],
                 dtype_names=["float32"],
                 shapes=[[10, 10]],
-                nnz_list=[3],
-                indices_dtype_name="int32",
+                num_updates_list=[3],
                 update_kind="sparse_flat",
             )
 
@@ -133,21 +129,19 @@ class TestNCCLWeightTransferUpdateInfoValidation:
                 names=["layer.weight"],
                 dtype_names=["float32"],
                 shapes=[[10, 10]],
-                nnz_list=[3],
-                indices_dtype_name="int32",
+                num_updates_list=[3],
                 is_checkpoint_format=False,
                 update_kind="sparse_flat",
                 packed=True,
             )
 
-    def test_sparse_update_rejects_non_int32_indices(self):
-        with pytest.raises(ValueError, match="indices_dtype_name='int32'"):
+    def test_sparse_update_rejects_mismatched_num_updates(self):
+        with pytest.raises(ValueError, match="`num_updates_list`"):
             NCCLWeightTransferUpdateInfo(
-                names=["layer.weight"],
-                dtype_names=["float32"],
-                shapes=[[10, 10]],
-                nnz_list=[3],
-                indices_dtype_name="int64",
+                names=["layer.weight", "layer.bias"],
+                dtype_names=["float32", "float32"],
+                shapes=[[10, 10], [10]],
+                num_updates_list=[3],
                 is_checkpoint_format=False,
                 update_kind="sparse_flat",
             )
@@ -158,8 +152,7 @@ class TestNCCLWeightTransferUpdateInfoValidation:
                 names=["layer.weight"],
                 dtype_names=["float32"],
                 shapes=[[10, 10]],
-                nnz_list=[3],
-                indices_dtype_name="int32",
+                num_updates_list=[3],
             )
 
 
@@ -307,8 +300,7 @@ def test_nccl_receive_sparse_weights_without_init_raises():
         names=["w"],
         dtype_names=["float32"],
         shapes=[[10]],
-        nnz_list=[2],
-        indices_dtype_name="int32",
+        num_updates_list=[2],
         is_checkpoint_format=False,
         update_kind="sparse_flat",
     )
@@ -556,8 +548,7 @@ def inference_receive_sparse_tensor(
         names=["test.weight"],
         dtype_names=["float32"],
         shapes=[[30]],
-        nnz_list=[3],
-        indices_dtype_name="int32",
+        num_updates_list=[3],
         is_checkpoint_format=False,
         update_kind="sparse_flat",
     )
@@ -701,8 +692,24 @@ class TestIPCWeightTransferUpdateInfoValidation:
                 names=["layer.weight"],
                 dtype_names=["float32"],
                 shapes=[[10, 10]],
+                num_updates_list=[1],
                 ipc_handles=ipc_handles,
+                is_checkpoint_format=False,
                 update_kind="sparse_flat",
+            )
+
+    def test_sparse_methods_not_supported(self):
+        """Test that IPC engine explicitly rejects sparse transfer methods."""
+        config = WeightTransferConfig(backend="ipc")
+        parallel_config = create_mock_parallel_config()
+        engine = IPCWeightTransferEngine(config, parallel_config)
+
+        with pytest.raises(NotImplementedError, match="dense updates"):
+            engine.receive_sparse_weights(MagicMock(), lambda _: None)
+        with pytest.raises(NotImplementedError, match="dense updates"):
+            engine.trainer_send_sparse_weights(
+                iter([]),
+                {"mode": "http", "url": "http://localhost:8000"},
             )
 
     def test_valid_update_info_from_pickled(self, monkeypatch):

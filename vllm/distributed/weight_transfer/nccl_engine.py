@@ -69,8 +69,6 @@ class NCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]
-    nnz_list: list[int] | None = None
-    indices_dtype_name: str | None = None
     packed: bool = False
     """Whether to use packed tensor broadcasting for efficiency.
     When True, multiple tensors are batched together before broadcasting
@@ -97,32 +95,11 @@ class NCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
                 f"got {len(self.shapes)} and {len(self.names)}"
             )
         if self.update_kind == "dense":
-            if self.nnz_list is not None or self.indices_dtype_name is not None:
-                raise ValueError(
-                    "Sparse metadata is only supported for `update_kind='sparse_flat'`"
-                )
             return
 
-        if self.is_checkpoint_format:
-            raise ValueError(
-                "`update_kind='sparse_flat'` requires `is_checkpoint_format=False`"
-            )
         if self.packed:
             raise ValueError(
                 "`update_kind='sparse_flat'` cannot be combined with `packed=True`"
-            )
-        if self.nnz_list is None:
-            raise ValueError("`nnz_list` is required for sparse updates")
-        if len(self.nnz_list) != num_params:
-            raise ValueError(
-                f"`nnz_list` should be of the same size as `names`: "
-                f"got {len(self.nnz_list)} and {len(self.names)}"
-            )
-        if any(nnz < 0 for nnz in self.nnz_list):
-            raise ValueError("Sparse `nnz_list` entries must be non-negative")
-        if self.indices_dtype_name != "int32":
-            raise ValueError(
-                "`indices_dtype_name='int32'` is required for sparse updates"
             )
 
 
@@ -255,18 +232,16 @@ class NCCLWeightTransferEngine(
             )
         if update_info.update_kind != "sparse_flat":
             raise ValueError("Sparse receive path requires `update_kind='sparse_flat'`")
-        assert update_info.nnz_list is not None
-        assert update_info.indices_dtype_name is not None
+        assert update_info.num_updates_list is not None
 
-        indices_dtype = getattr(torch, update_info.indices_dtype_name)
-        for name, dtype_name, nnz in zip(
+        for name, dtype_name, num_updates in zip(
             update_info.names,
             update_info.dtype_names,
-            update_info.nnz_list,
+            update_info.num_updates_list,
         ):
             dtype = getattr(torch, dtype_name)
-            indices = torch.empty(nnz, dtype=indices_dtype, device="cuda")
-            values = torch.empty(nnz, dtype=dtype, device="cuda")
+            indices = torch.empty(num_updates, dtype=torch.int32, device="cuda")
+            values = torch.empty(num_updates, dtype=dtype, device="cuda")
             self.model_update_group.broadcast(
                 indices, src=0, stream=torch.cuda.current_stream()
             )
