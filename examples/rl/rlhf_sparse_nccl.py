@@ -207,7 +207,11 @@ class TrainModel:
         )
 
         with torch.no_grad():
-            self.patched_param[row_ids] = 0
+            # Rotate the selected embedding rows instead of zeroing them so the
+            # patch remains deterministic while avoiding a degenerate collapse
+            # to the same special token after the update.
+            replacement_rows = self.patched_param[row_ids].roll(shifts=1, dims=0)
+            self.patched_param[row_ids] = replacement_rows
 
         flat_indices = (
             row_ids.unsqueeze(1).mul(hidden_size).add(column_offsets).reshape(-1)

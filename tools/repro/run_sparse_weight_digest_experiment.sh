@@ -2,9 +2,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VENV_PYTHON="${VENV_PYTHON:-/workspace/.venv/bin/python}"
+VENV_BIN_DIR="${VENV_BIN_DIR:-${REPO_ROOT}/.venv/bin}"
+VENV_PYTHON="${VENV_PYTHON:-${VENV_BIN_DIR}/python}"
 
-source /workspace/.venv/bin/activate
+source "${VENV_BIN_DIR}/activate"
 unset LD_LIBRARY_PATH
 
 export VLLM_HOST_IP="${VLLM_HOST_IP:-$(ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1)}"
