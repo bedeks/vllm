@@ -227,7 +227,12 @@ class TrainModel:
         ]
         patch_digest = hashlib.sha256(
             self.pending_sparse_patches[0].indices.cpu().numpy().tobytes()
-            + self.pending_sparse_patches[0].values.float().cpu().numpy().tobytes()
+            + self.pending_sparse_patches[0]
+            .values.detach()
+            .float()
+            .cpu()
+            .numpy()
+            .tobytes()
         ).hexdigest()
 
         sparse_payload_bytes = (
