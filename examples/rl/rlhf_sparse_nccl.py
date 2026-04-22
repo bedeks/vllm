@@ -31,6 +31,7 @@ Current sparse weight transfer MVP limitations:
 This example assumes a single-node cluster with two GPUs.
 """
 
+import hashlib
 import os
 import time
 from collections.abc import Sequence
@@ -169,7 +170,7 @@ class TrainModel:
         self,
         prompts: Sequence[str],
         max_patch_rows: int = MAX_PATCH_ROWS,
-    ) -> tuple[dict[str, object], list[int], int]:
+    ) -> tuple[dict[str, object], list[int], str, int]:
         selected_token_ids: list[int] = []
         special_ids = set(self.tokenizer.all_special_ids)
         for prompt in prompts:
@@ -224,6 +225,10 @@ class TrainModel:
                 values=flat_values,
             )
         ]
+        patch_digest = hashlib.sha256(
+            self.pending_sparse_patches[0].indices.cpu().numpy().tobytes()
+            + self.pending_sparse_patches[0].values.float().cpu().numpy().tobytes()
+        ).hexdigest()
 
         sparse_payload_bytes = (
             flat_indices.numel() * torch.tensor([], dtype=torch.int32).element_size()
@@ -237,7 +242,7 @@ class TrainModel:
             is_checkpoint_format=False,
             update_kind="sparse_flat",
         )
-        return update_info, selected_token_ids, sparse_payload_bytes
+        return update_info, selected_token_ids, patch_digest, sparse_payload_bytes
 
     def broadcast_weights(self, packed: bool = False) -> float:
         if self.model_update_group is None:
@@ -322,11 +327,10 @@ def run_dense_phase(
     train_model,
     scheduling_inference: PlacementGroupSchedulingStrategy,
 ) -> dict[str, object]:
+    ray.get(train_model.reset_model.remote())
     llm = launch_llm(scheduling_inference)
     try:
-        trainer_before = ray.get(train_model.generate.remote(PROMPTS))
         dense_before = collect_vllm_generations(llm)
-        trainer_before_equal = token_sequences_match(trainer_before, dense_before)
 
         ray.get(llm.sleep.remote(level=0))
         master_address, master_port = ray.get(train_model.create_rendezvous.remote())
@@ -347,10 +351,9 @@ def run_dense_phase(
         dense_update_info, dense_payload_bytes = ray.get(
             train_model.get_dense_update_info.remote()
         )
-        _, selected_token_ids, _ = ray.get(
+        _, selected_token_ids, patch_digest, _ = ray.get(
             train_model.prepare_sparse_patch.remote(PROMPTS)
         )
-        trainer_after = ray.get(train_model.generate.remote(PROMPTS))
 
         inference_update = llm.update_weights.remote(
             dict(update_info=dense_update_info)
@@ -364,16 +367,12 @@ def run_dense_phase(
         ray.get(llm.wake_up.remote(tags=["scheduling"]))
 
         dense_after = collect_vllm_generations(llm)
-        trainer_after_equal = token_sequences_match(trainer_after, dense_after)
 
         return {
-            "trainer_before": trainer_before,
             "dense_before": dense_before,
-            "trainer_before_equal": trainer_before_equal,
-            "trainer_after": trainer_after,
             "dense_after": dense_after,
-            "trainer_after_equal": trainer_after_equal,
             "selected_token_ids": selected_token_ids,
+            "patch_digest": patch_digest,
             "dense_payload_bytes": dense_payload_bytes,
             "dense_send_ms": dense_send_ms,
         }
@@ -385,11 +384,10 @@ def run_sparse_phase(
     train_model,
     scheduling_inference: PlacementGroupSchedulingStrategy,
 ) -> dict[str, object]:
+    ray.get(train_model.reset_model.remote())
     llm = launch_llm(scheduling_inference)
     try:
-        trainer_before = ray.get(train_model.generate.remote(PROMPTS))
         sparse_before = collect_vllm_generations(llm)
-        trainer_before_equal = token_sequences_match(trainer_before, sparse_before)
 
         ray.get(llm.sleep.remote(level=0))
         master_address, master_port = ray.get(train_model.create_rendezvous.remote())
@@ -407,10 +405,9 @@ def run_sparse_phase(
         trainer_init = train_model.init_weight_transfer_group.remote(world_size)
         ray.get([trainer_init, inference_init])
 
-        sparse_update_info, selected_token_ids, sparse_payload_bytes = ray.get(
-            train_model.prepare_sparse_patch.remote(PROMPTS)
+        sparse_update_info, selected_token_ids, patch_digest, sparse_payload_bytes = (
+            ray.get(train_model.prepare_sparse_patch.remote(PROMPTS))
         )
-        trainer_after = ray.get(train_model.generate.remote(PROMPTS))
 
         inference_update = llm.update_weights.remote(
             dict(update_info=sparse_update_info)
@@ -424,16 +421,12 @@ def run_sparse_phase(
         ray.get(llm.wake_up.remote(tags=["scheduling"]))
 
         sparse_after = collect_vllm_generations(llm)
-        trainer_after_equal = token_sequences_match(trainer_after, sparse_after)
 
         return {
-            "trainer_before": trainer_before,
             "sparse_before": sparse_before,
-            "trainer_before_equal": trainer_before_equal,
-            "trainer_after": trainer_after,
             "sparse_after": sparse_after,
-            "trainer_after_equal": trainer_after_equal,
             "selected_token_ids": selected_token_ids,
+            "patch_digest": patch_digest,
             "sparse_payload_bytes": sparse_payload_bytes,
             "sparse_send_ms": sparse_send_ms,
         }
@@ -455,7 +448,6 @@ try:
     )
 
     dense_results = run_dense_phase(train_model, scheduling_inference)
-    ray.get(train_model.reset_model.remote())
     sparse_results = run_sparse_phase(train_model, scheduling_inference)
 
     baseline_equal = token_sequences_match(
@@ -465,6 +457,7 @@ try:
     patch_selection_equal = (
         dense_results["selected_token_ids"] == sparse_results["selected_token_ids"]
     )
+    patch_digest_equal = dense_results["patch_digest"] == sparse_results["patch_digest"]
     after_equal = token_sequences_match(
         dense_results["dense_after"],
         sparse_results["sparse_after"],
@@ -498,11 +491,10 @@ try:
 
     print(f"patched_token_ids = {dense_results['selected_token_ids']}")
     print(f"patch_selection_equal = {patch_selection_equal}")
-    print(f"dense_trainer_before_equal = {dense_results['trainer_before_equal']}")
-    print(f"sparse_trainer_before_equal = {sparse_results['trainer_before_equal']}")
+    print(f"dense_patch_digest = {dense_results['patch_digest']}")
+    print(f"sparse_patch_digest = {sparse_results['patch_digest']}")
+    print(f"patch_digest_equal = {patch_digest_equal}")
     print(f"baseline_equal = {baseline_equal}")
-    print(f"dense_trainer_after_equal = {dense_results['trainer_after_equal']}")
-    print(f"sparse_trainer_after_equal = {sparse_results['trainer_after_equal']}")
     print(f"after_equal = {after_equal}")
     print(f"any_output_changed = {any_output_changed}")
     print(f"dense_payload_mb = {dense_payload_mb:.2f}")
@@ -516,7 +508,11 @@ try:
         )
     if not patch_selection_equal:
         raise RuntimeError("Dense and sparse phases used different sparse patches")
+    if not patch_digest_equal:
+        raise RuntimeError("Dense and sparse phases produced different patch values")
     if not after_equal:
         raise RuntimeError("Dense and sparse updates produced different outputs")
+    if not any_output_changed:
+        raise RuntimeError("Patch did not change the observed outputs")
 finally:
     ray.shutdown()
