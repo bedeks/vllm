@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.v1.worker.gpu import eplb_utils as eplb
@@ -49,6 +50,60 @@ class FakeEplbState:
         state = cls(kwargs["parallel_config"], kwargs["device"])
         state.built_from_mapping = True
         return state
+
+
+class FakeCudaGraphManager:
+    def __init__(self, pool: Any, needs_capture: bool = True):
+        self.pool = pool
+        self._needs_capture = needs_capture
+        self.capture_pools: list[Any] = []
+        self.capture_kwargs: list[dict[str, Any]] = []
+        self.reset_calls = 0
+
+    def needs_capture(self) -> bool:
+        return self._needs_capture
+
+    def capture(self, *args, **kwargs) -> None:
+        self.capture_pools.append(self.pool)
+        self.capture_kwargs.append(kwargs)
+
+    def reset_cudagraph_state(self) -> None:
+        self.reset_calls += 1
+
+
+class RaisingCudaGraphManager(FakeCudaGraphManager):
+    def capture(self, *args, **kwargs) -> None:
+        super().capture(*args, **kwargs)
+        raise RuntimeError("capture failed")
+
+
+class FakeSpeculator:
+    def __init__(self, prefill_pool: Any, decode_pool: Any):
+        self.prefill_cudagraph_manager = SimpleNamespace(pool=prefill_pool)
+        self.decode_cudagraph_manager = SimpleNamespace(pool=decode_pool)
+        self.capture_pools: list[tuple[Any, Any]] = []
+        self.reset_calls = 0
+
+    def set_cudagraph_pools(
+        self,
+        prefill_pool: Any,
+        decode_pool: Any | None = None,
+    ) -> None:
+        self.prefill_cudagraph_manager.pool = prefill_pool
+        self.decode_cudagraph_manager.pool = (
+            prefill_pool if decode_pool is None else decode_pool
+        )
+
+    def capture_model(self) -> None:
+        self.capture_pools.append(
+            (
+                self.prefill_cudagraph_manager.pool,
+                self.decode_cudagraph_manager.pool,
+            )
+        )
+
+    def reset_cudagraph_state(self) -> None:
+        self.reset_calls += 1
 
 
 def _make_runner(**overrides: Any) -> Any:
@@ -185,3 +240,124 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
 
     assert mrv2.GPUModelRunner.sample_tokens(runner, None) is None
     assert events == ["postprocess", "eplb"]
+
+
+def test_v2_profile_cudagraph_memory_uses_temporary_pools(monkeypatch):
+    manager = FakeCudaGraphManager(pool="main-runtime-pool")
+    speculator = FakeSpeculator("spec-runtime-pool", "spec-runtime-pool")
+    runner = _make_runner(
+        cudagraph_manager=manager,
+        speculator=speculator,
+        model="model",
+        model_state="model-state",
+        input_buffers="input-buffers",
+        intermediate_tensors="intermediate-tensors",
+        block_tables="block-tables",
+        attn_groups="attn-groups",
+        kv_cache_config="kv-cache-config",
+    )
+
+    graph_pools = iter(["main-profile-pool", "spec-profile-pool"])
+    mem_info = iter([(10_000, 0), (8_500, 0)])
+    monkeypatch.setattr(
+        mrv2.torch.cuda,
+        "graph_pool_handle",
+        lambda: next(graph_pools),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.cuda,
+        "mem_get_info",
+        lambda: next(mem_info),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "empty_cache", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "synchronize", lambda: None, raising=False
+    )
+    monkeypatch.setattr(mrv2.gc, "collect", lambda: None)
+
+    estimate = mrv2.GPUModelRunner.profile_cudagraph_memory(runner)
+
+    assert estimate == 1_500
+    assert manager.capture_pools == ["main-profile-pool"]
+    assert manager.capture_kwargs == [
+        {
+            "has_lora": False,
+            "use_aux_hidden_state_outputs": False,
+        }
+    ]
+    assert speculator.capture_pools == [("spec-profile-pool", "spec-profile-pool")]
+    assert manager.reset_calls == 1
+    assert speculator.reset_calls == 1
+    assert manager.pool == "main-runtime-pool"
+    assert speculator.prefill_cudagraph_manager.pool == "spec-runtime-pool"
+    assert speculator.decode_cudagraph_manager.pool == "spec-runtime-pool"
+
+
+def test_v2_profile_cudagraph_memory_skips_when_capture_disabled(monkeypatch):
+    manager = FakeCudaGraphManager(pool="main-runtime-pool", needs_capture=False)
+    speculator = FakeSpeculator("spec-runtime-pool", "spec-runtime-pool")
+    runner = _make_runner(cudagraph_manager=manager, speculator=speculator)
+
+    mem_get_info_called = False
+
+    def _mem_get_info():
+        nonlocal mem_get_info_called
+        mem_get_info_called = True
+        return (0, 0)
+
+    monkeypatch.setattr(mrv2.torch.cuda, "mem_get_info", _mem_get_info, raising=False)
+
+    assert mrv2.GPUModelRunner.profile_cudagraph_memory(runner) == 0
+    assert mem_get_info_called is False
+    assert manager.capture_pools == []
+    assert speculator.capture_pools == []
+
+
+def test_v2_profile_cudagraph_memory_restores_state_after_failure(monkeypatch):
+    manager = RaisingCudaGraphManager(pool="main-runtime-pool")
+    speculator = FakeSpeculator("spec-runtime-pool", "spec-runtime-pool")
+    runner = _make_runner(
+        cudagraph_manager=manager,
+        speculator=speculator,
+        model="model",
+        model_state="model-state",
+        input_buffers="input-buffers",
+        intermediate_tensors="intermediate-tensors",
+        block_tables="block-tables",
+        attn_groups="attn-groups",
+        kv_cache_config="kv-cache-config",
+    )
+
+    graph_pools = iter(["main-profile-pool", "spec-profile-pool"])
+    monkeypatch.setattr(
+        mrv2.torch.cuda,
+        "graph_pool_handle",
+        lambda: next(graph_pools),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.cuda,
+        "mem_get_info",
+        lambda: (10_000, 0),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "empty_cache", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "synchronize", lambda: None, raising=False
+    )
+    monkeypatch.setattr(mrv2.gc, "collect", lambda: None)
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        mrv2.GPUModelRunner.profile_cudagraph_memory(runner)
+
+    assert manager.reset_calls == 1
+    assert speculator.reset_calls == 1
+    assert manager.pool == "main-runtime-pool"
+    assert speculator.prefill_cudagraph_manager.pool == "spec-runtime-pool"
+    assert speculator.decode_cudagraph_manager.pool == "spec-runtime-pool"

@@ -173,6 +173,10 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def reset_cudagraph_state(self) -> None:
+        self.graphs.clear()
+        self._graphs_captured = False
+
     @torch.inference_mode()
     def capture(
         self,
@@ -276,6 +280,12 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+
+    def reset_cudagraph_state(self) -> None:
+        super().reset_cudagraph_state()
+        self.hidden_states = None
+        self.aux_hidden_states = []
+        self.intermediate_tensors = None
 
     def capture(
         self,

@@ -136,6 +136,26 @@ class EagleSpeculator:
         # execute concurrently.
         self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
 
+    def set_cudagraph_pools(
+        self,
+        prefill_pool: object | None,
+        decode_pool: object | None = None,
+    ) -> None:
+        if self.prefill_cudagraph_manager is None:
+            return
+        self.prefill_cudagraph_manager.pool = prefill_pool
+        if self.decode_cudagraph_manager is None:
+            return
+        self.decode_cudagraph_manager.pool = (
+            prefill_pool if decode_pool is None else decode_pool
+        )
+
+    def reset_cudagraph_state(self) -> None:
+        if self.prefill_cudagraph_manager is not None:
+            self.prefill_cudagraph_manager.reset_cudagraph_state()
+        if self.decode_cudagraph_manager is not None:
+            self.decode_cudagraph_manager.reset_cudagraph_state()
+
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = get_layers_from_vllm_config(
             self.vllm_config,

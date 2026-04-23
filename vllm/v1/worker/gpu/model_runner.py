@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -560,9 +561,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # SP is not supported yet.
         return num_scheduled_tokens
 
+    def _reset_cudagraph_state(self) -> None:
+        assert self.cudagraph_manager is not None
+        self.cudagraph_manager.reset_cudagraph_state()
+        if self.speculator is not None:
+            self.speculator.reset_cudagraph_state()
+
+    @contextmanager
+    def _temporary_cudagraph_pools(self):
+        assert self.cudagraph_manager is not None
+
+        original_main_pool = self.cudagraph_manager.pool
+        original_spec_pools: tuple[object | None, object | None] | None = None
+        self.cudagraph_manager.pool = torch.cuda.graph_pool_handle()
+
+        if self.speculator is not None:
+            assert self.speculator.prefill_cudagraph_manager is not None
+            original_spec_pools = (
+                self.speculator.prefill_cudagraph_manager.pool,
+                self.speculator.decode_cudagraph_manager.pool
+                if self.speculator.decode_cudagraph_manager is not None
+                else None,
+            )
+            self.speculator.set_cudagraph_pools(torch.cuda.graph_pool_handle())
+
+        try:
+            yield
+        finally:
+            self._reset_cudagraph_state()
+            self.cudagraph_manager.pool = original_main_pool
+            if self.speculator is not None and original_spec_pools is not None:
+                self.speculator.set_cudagraph_pools(*original_spec_pools)
+
     def profile_cudagraph_memory(self) -> int:
-        # NOTE(woosuk): It is TBD whether we keep this API or not.
-        return 0
+        assert self.cudagraph_manager is not None
+        if not self.cudagraph_manager.needs_capture():
+            logger.debug("No CUDA graphs will be captured, skipping profiling")
+            return 0
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+        with (
+            self._temporary_cudagraph_pools(),
+            self.maybe_setup_dummy_loras(self.lora_config),
+        ):
+            self.cudagraph_manager.capture(
+                self.model,
+                self.model_state,
+                self.input_buffers,
+                self.intermediate_tensors,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                has_lora=self.lora_config is not None,
+                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+            )
+            if self.speculator is not None:
+                self.speculator.capture_model()
+            torch.accelerator.synchronize()
+            end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        estimate = start_free_gpu_memory - end_free_gpu_memory
+        logger.info(
+            "Estimated CUDA graph memory: %s GiB total",
+            format_gib(estimate),
+        )
+        return estimate
 
     @torch.inference_mode()
     def capture_model(self) -> int:
