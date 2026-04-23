@@ -82,6 +82,16 @@ FORCE_INLINE vec_op::FP32Vec8 gelu_tanh_act(const vec_op::FP32Vec8& x) {
   const vec_op::FP32Vec8 inner = w1 * (x + x_3 * w3);
   return x * w2 * (ones + inner.tanh());
 }
+
+template <typename scalar_t>
+void relu2_kernel(const int64_t numel, const scalar_t* in_ptr,
+                  scalar_t* out_ptr) {
+#pragma omp parallel for
+  for (int64_t i = 0; i < numel; ++i) {
+    const float x = static_cast<float>(in_ptr[i]);
+    out_ptr[i] = static_cast<scalar_t>(x > 0.0f ? x * x : 0.0f);
+  }
+}
 };  // namespace
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input) {
@@ -159,5 +169,16 @@ void gelu_quick(torch::Tensor& out, torch::Tensor& input) {
     activation_kernel<scalar_t, gelu_quick_act, false>(
         num_tokens, d, input.data_ptr<scalar_t>(), out.data_ptr<scalar_t>());
     CPU_KERNEL_GUARD_OUT(gelu_quick_impl)
+  });
+}
+
+void relu2(torch::Tensor& out, torch::Tensor& input) {
+  const int64_t numel = input.numel();
+
+  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "relu2_impl", [&] {
+    CPU_KERNEL_GUARD_IN(relu2_impl)
+    relu2_kernel<scalar_t>(numel, input.data_ptr<scalar_t>(),
+                           out.data_ptr<scalar_t>());
+    CPU_KERNEL_GUARD_OUT(relu2_impl)
   });
 }

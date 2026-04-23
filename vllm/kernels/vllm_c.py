@@ -31,3 +31,10 @@ def rms_norm(
     output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     torch.ops._C.rms_norm(output, x, weight, epsilon)
     return output
+
+
+@ir.ops.relu2.register_impl("vllm_c", supported=CUDA_ALIKE)
+def relu2(x: Tensor) -> Tensor:
+    output = torch.empty_like(x)
+    torch.ops._C.relu2(output, x)
+    return output
