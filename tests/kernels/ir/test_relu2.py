@@ -11,13 +11,14 @@ from vllm.platforms import current_platform
 
 RELU2_HIDDEN_SIZES = [16, 128, 1024]
 RELU2_NUM_TOKENS = [1, 17, 512]
+VLLM_C_SUPPORTED = current_platform.is_cuda_alike() or current_platform.is_cpu()
 relu2_native = ir.ops.relu2.impls["native"].impl_fn
 
 
 def test_relu2_registration():
     expected = {
         "native": True,
-        "vllm_c": current_platform.is_cuda_alike(),
+        "vllm_c": VLLM_C_SUPPORTED,
         "xpu_kernels": False,
     }
 
@@ -67,6 +68,35 @@ class TestRelu2:
             out_dispatched = ir.ops.relu2(*args)
         out_direct = impl.impl_fn(*args)
         torch.testing.assert_close(out_dispatched, out_direct, rtol=0.0, atol=0.0)
+
+    @pytest.mark.parametrize("provider", ["vllm_c", "native"])
+    def test_preserves_nan(self, dtype, n_tokens, hidden_size, provider):
+        impl = ir.ops.relu2.impls[provider]
+        if not impl.supported:
+            pytest.skip(f"{provider} impl not supported on this platform")
+
+        x = torch.tensor(
+            [
+                float("nan"),
+                -2.0,
+                -0.0,
+                0.0,
+                1.5,
+                float("nan"),
+                3.0,
+                -4.0,
+                2.5,
+                -1.0,
+            ],
+            dtype=dtype,
+            device=current_platform.device_type,
+        ).reshape(2, 5)
+
+        expected = relu2_native(x.clone())
+        output = impl.impl_fn(x.clone())
+        torch.testing.assert_close(
+            output, expected, rtol=0.0, atol=0.0, equal_nan=True
+        )
 
     @pytest.mark.parametrize("provider", ["vllm_c", "native"])
     def test_torch_opcheck(self, dtype, n_tokens, hidden_size, provider):

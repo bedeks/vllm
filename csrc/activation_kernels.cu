@@ -569,7 +569,7 @@ __device__ __forceinline__ T gelu_quick_kernel(const T& x) {
 template <typename T>
 __device__ __forceinline__ T relu2_kernel(const T& x) {
   const float f = (float)x;
-  return f > 0.0f ? (T)(f * f) : (T)0.0f;
+  return f <= 0.0f ? (T)0.0f : (T)(f * f);
 }
 
 }  // namespace vllm
