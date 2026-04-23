@@ -176,7 +176,7 @@ class MulAndSilu(CustomOp):
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
-        return ir.ops.mul_and_silu(x)
+        return ir.ops.mul_and_silu.impls["native"].impl_fn(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return ir.ops.mul_and_silu(x)
