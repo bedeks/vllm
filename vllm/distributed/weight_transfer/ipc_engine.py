@@ -16,7 +16,6 @@ from vllm import envs
 from vllm.config.parallel import ParallelConfig
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
-    SparseWeightPatch,
     WeightTransferEngine,
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
@@ -198,13 +197,6 @@ class IPCWeightTransferEngine(
 
         load_weights(weights)
 
-    def receive_sparse_weights(
-        self,
-        _update_info: IPCWeightTransferUpdateInfo,
-        _apply_patches: Callable[[list[SparseWeightPatch]], None],
-    ) -> None:
-        raise NotImplementedError("IPC weight transfer only supports dense updates")
-
     def shutdown(self) -> None:
         """
         Shutdown the weight transfer engine.
@@ -309,10 +301,3 @@ class IPCWeightTransferEngine(
             }
             response = requests.post(url, json=payload, timeout=300)
             response.raise_for_status()
-
-    @staticmethod
-    def trainer_send_sparse_weights(
-        _iterator: Iterator[SparseWeightPatch],
-        _trainer_args: dict[str, Any] | IPCTrainerSendWeightsArgs,
-    ) -> None:
-        raise NotImplementedError("IPC weight transfer only supports dense updates")

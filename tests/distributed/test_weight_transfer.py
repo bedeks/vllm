@@ -699,14 +699,14 @@ class TestIPCWeightTransferUpdateInfoValidation:
             )
 
     def test_sparse_methods_not_supported(self):
-        """Test that IPC engine explicitly rejects sparse transfer methods."""
+        """Test that IPC engine inherits sparse rejection from the base class."""
         config = WeightTransferConfig(backend="ipc")
         parallel_config = create_mock_parallel_config()
         engine = IPCWeightTransferEngine(config, parallel_config)
 
-        with pytest.raises(NotImplementedError, match="dense updates"):
+        with pytest.raises(NotImplementedError, match="(?i)sparse weight updates"):
             engine.receive_sparse_weights(MagicMock(), lambda _: None)
-        with pytest.raises(NotImplementedError, match="dense updates"):
+        with pytest.raises(NotImplementedError, match="(?i)sparse weight updates"):
             engine.trainer_send_sparse_weights(
                 iter([]),
                 {"mode": "http", "url": "http://localhost:8000"},
