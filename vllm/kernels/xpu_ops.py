@@ -38,9 +38,7 @@ def rms_norm(
     return output
 
 
-@ir.ops.mul_and_silu.register_impl(
-    "xpu_kernels", supported=XPU_KERNELS_SUPPORTED
-)
+@ir.ops.mul_and_silu.register_impl("xpu_kernels", supported=XPU_KERNELS_SUPPORTED)
 def mul_and_silu(x: Tensor) -> Tensor:
     d = x.shape[-1] // 2
     output_shape = x.shape[:-1] + (d,)

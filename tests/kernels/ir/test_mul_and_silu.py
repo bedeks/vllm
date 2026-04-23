@@ -31,8 +31,7 @@ def test_mul_and_silu_registration():
         "xpu_kernels": current_platform.is_xpu(),
     }
     actual = {
-        provider: impl.supported
-        for provider, impl in ir.ops.mul_and_silu.impls.items()
+        provider: impl.supported for provider, impl in ir.ops.mul_and_silu.impls.items()
     }
     assert actual == expected
 
