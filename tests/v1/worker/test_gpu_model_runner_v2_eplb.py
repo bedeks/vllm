@@ -361,3 +361,67 @@ def test_v2_profile_cudagraph_memory_restores_state_after_failure(monkeypatch):
     assert manager.pool == "main-runtime-pool"
     assert speculator.prefill_cudagraph_manager.pool == "spec-runtime-pool"
     assert speculator.decode_cudagraph_manager.pool == "spec-runtime-pool"
+
+
+def test_v2_profile_cudagraph_memory_initializes_minimal_kv_cache(monkeypatch):
+    manager = FakeCudaGraphManager(pool="main-runtime-pool")
+    speculator = FakeSpeculator("spec-runtime-pool", "spec-runtime-pool")
+    runner = _make_runner(
+        cudagraph_manager=None,
+        speculator=speculator,
+        model="model",
+        model_state="model-state",
+        input_buffers="input-buffers",
+        intermediate_tensors="intermediate-tensors",
+        block_tables="block-tables",
+        attn_groups="attn-groups",
+        kv_cache_config="kv-cache-config",
+    )
+
+    lifecycle: list[str] = []
+
+    def _init_minimal():
+        lifecycle.append("init")
+        runner.cudagraph_manager = manager
+
+    def _cleanup():
+        lifecycle.append("cleanup")
+        runner.cudagraph_manager = None
+
+    graph_pools = iter(["main-profile-pool", "spec-profile-pool"])
+    mem_info = iter([(10_000, 0), (8_500, 0)])
+    monkeypatch.setattr(
+        runner,
+        "_init_minimal_kv_cache_for_profiling",
+        _init_minimal,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_profiling_kv_cache",
+        _cleanup,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.cuda,
+        "graph_pool_handle",
+        lambda: next(graph_pools),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.cuda,
+        "mem_get_info",
+        lambda: next(mem_info),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "empty_cache", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        mrv2.torch.accelerator, "synchronize", lambda: None, raising=False
+    )
+    monkeypatch.setattr(mrv2.gc, "collect", lambda: None)
+
+    estimate = mrv2.GPUModelRunner.profile_cudagraph_memory(runner)
+
+    assert estimate == 1_500
+    assert lifecycle == ["init", "cleanup"]
+    assert runner.cudagraph_manager is None

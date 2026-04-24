@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -561,6 +561,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # SP is not supported yet.
         return num_scheduled_tokens
 
+    def _init_minimal_kv_cache_for_profiling(self) -> None:
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups,
+            get_kv_cache_groups,
+        )
+
+        kv_cache_spec = self.get_kv_cache_spec()
+        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
+
+        saved_override = self.cache_config.num_gpu_blocks_override
+        self.cache_config.num_gpu_blocks_override = min_blocks
+        minimal_config = get_kv_cache_config_from_groups(
+            self.vllm_config,
+            kv_cache_groups,
+            available_memory=0,
+            suppress_log=True,
+        )
+        self.cache_config.num_gpu_blocks_override = saved_override
+
+        self.initialize_kv_cache(minimal_config)
+        self.cache_config.num_gpu_blocks = minimal_config.num_blocks
+
+    def _cleanup_profiling_kv_cache(self) -> None:
+        torch.accelerator.synchronize()
+        if hasattr(self, "kv_caches") and self.kv_caches:
+            for i in range(len(self.kv_caches)):
+                self.kv_caches[i] = None  # type: ignore
+            self.kv_caches.clear()
+        if hasattr(self, "attn_groups"):
+            self.attn_groups.clear()
+        if hasattr(self, "attn_backends"):
+            self.attn_backends.clear()
+        if hasattr(self, "kv_cache_config"):
+            delattr(self, "kv_cache_config")
+        self.cudagraph_manager = None
+        self.kv_connector = NO_OP_KV_CONNECTOR
+        self.cache_config.num_gpu_blocks = None
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+
     def _reset_cudagraph_state(self) -> None:
         assert self.cudagraph_manager is not None
         self.cudagraph_manager.reset_cudagraph_state()
@@ -594,44 +636,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.set_cudagraph_pools(*original_spec_pools)
 
     def profile_cudagraph_memory(self) -> int:
+        owns_minimal_kv_cache = False
+        if self.cudagraph_manager is None:
+            with set_current_vllm_config(self.vllm_config):
+                self._init_minimal_kv_cache_for_profiling()
+            owns_minimal_kv_cache = True
+
         assert self.cudagraph_manager is not None
-        if not self.cudagraph_manager.needs_capture():
-            logger.debug("No CUDA graphs will be captured, skipping profiling")
-            return 0
+        try:
+            if not self.cudagraph_manager.needs_capture():
+                logger.debug("No CUDA graphs will be captured, skipping profiling")
+                return 0
 
-        gc.collect()
-        torch.accelerator.empty_cache()
-        torch.accelerator.synchronize()
-        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
-
-        with (
-            self._temporary_cudagraph_pools(),
-            self.maybe_setup_dummy_loras(self.lora_config),
-        ):
-            self.cudagraph_manager.capture(
-                self.model,
-                self.model_state,
-                self.input_buffers,
-                self.intermediate_tensors,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                has_lora=self.lora_config is not None,
-                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-            )
-            if self.speculator is not None:
-                self.speculator.capture_model()
+            gc.collect()
+            torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
-            end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+            start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
-        gc.collect()
-        torch.accelerator.empty_cache()
-        estimate = start_free_gpu_memory - end_free_gpu_memory
-        logger.info(
-            "Estimated CUDA graph memory: %s GiB total",
-            format_gib(estimate),
-        )
-        return estimate
+            with (
+                self._temporary_cudagraph_pools(),
+                self.maybe_setup_dummy_loras(self.lora_config),
+            ):
+                self.cudagraph_manager.capture(
+                    self.model,
+                    self.model_state,
+                    self.input_buffers,
+                    self.intermediate_tensors,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    has_lora=self.lora_config is not None,
+                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                )
+                if self.speculator is not None:
+                    self.speculator.capture_model()
+                torch.accelerator.synchronize()
+                end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+            gc.collect()
+            torch.accelerator.empty_cache()
+            estimate = start_free_gpu_memory - end_free_gpu_memory
+            logger.info(
+                "Estimated CUDA graph memory: %s GiB total",
+                format_gib(estimate),
+            )
+            return estimate
+        finally:
+            if owns_minimal_kv_cache:
+                self._cleanup_profiling_kv_cache()
 
     @torch.inference_mode()
     def capture_model(self) -> int:
