@@ -51,7 +51,8 @@ def _create_proposer(
     attention_backend: str | None = None,
     speculative_token_tree: list[tuple[int, ...]] | None = None,
     parallel_drafting: bool = False,
-    rejection_sample_method: str = "strict",
+    rejection_sample_method: str = "standard",
+    draft_sample_method: str = "greedy",
 ) -> EagleProposer:
     # Method-dependent setup
     if method == "eagle":
@@ -90,6 +91,7 @@ def _create_proposer(
         speculative_token_tree=spec_token_tree_str,
         parallel_drafting=parallel_drafting,
         rejection_sample_method=rejection_sample_method,
+        draft_sample_method=draft_sample_method,
     )
     if parallel_drafting:
         # Overwrite pard_token to avoid crash during init
@@ -1016,7 +1018,7 @@ def test_propose(method, attn_backend, num_speculative_tokens, monkeypatch):
     assert torch.equal(result, expected_tokens)
 
 
-def test_propose_stores_probabilistic_draft_probs(monkeypatch):
+def test_propose_stores_gumbel_draft_probs(monkeypatch):
     device = torch.device(DEVICE_TYPE)
     batch_size = 2
     seq_lens = [5, 3]
@@ -1027,7 +1029,8 @@ def test_propose_stores_probabilistic_draft_probs(monkeypatch):
     proposer = _create_proposer(
         "draft_model",
         num_speculative_tokens,
-        rejection_sample_method="probabilistic",
+        rejection_sample_method="standard",
+        draft_sample_method="gumbel",
     )
     hidden_size = proposer.hidden_size
 
