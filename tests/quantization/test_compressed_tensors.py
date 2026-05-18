@@ -442,6 +442,48 @@ def test_compressed_tensors_w4a8_fp8(vllm_runner, args):
         assert output
 
 
+def test_llama_w4a8_load_weights_skips_derived_weight_chan_scale():
+    from vllm.model_executor.models.llama import LlamaModel
+
+    class FakeProj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight_scale = torch.nn.Parameter(torch.zeros(2))
+
+    class FakeMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.down_proj = FakeProj()
+            self.gate_up_proj = FakeProj()
+
+    class FakeLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = FakeMLP()
+
+    class FakeLlamaModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_config = None
+            self.layers = torch.nn.ModuleList([FakeLayer()])
+
+    model = FakeLlamaModel()
+
+    loaded = LlamaModel.load_weights(
+        model,
+        [
+            ("layers.0.mlp.down_proj.weight_chan_scale", torch.ones(2)),
+            ("layers.0.mlp.gate_proj.weight_chan_scale", torch.ones(2)),
+            ("layers.0.mlp.down_proj.weight_scale", torch.ones(2)),
+        ],
+    )
+
+    assert loaded == {"layers.0.mlp.down_proj.weight_scale"}
+    torch.testing.assert_close(
+        model.layers[0].mlp.down_proj.weight_scale, torch.ones(2)
+    )
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="This test is skipped on non-CUDA platform."
 )
