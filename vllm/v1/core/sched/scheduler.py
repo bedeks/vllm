@@ -146,6 +146,13 @@ class Scheduler(SchedulerInterface):
                 config=self.vllm_config, role=ECConnectorRole.SCHEDULER
             )
 
+        # req_id -> exported rollout artifact chunk handles. The worker exports
+        # chunks as generation progresses; the scheduler attaches the manifest
+        # to the final EngineCoreOutput for the request.
+        self._artifact_handles_by_req: dict[str, list[dict[str, Any]]] = defaultdict(
+            list
+        )
+
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -1397,6 +1404,7 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        artifact_connector_output = model_runner_output.artifact_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
         perf_stats: PerfStats | None = None
@@ -1412,6 +1420,10 @@ class Scheduler(SchedulerInterface):
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
                 kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+
+        if artifact_connector_output is not None:
+            for req_id, handles in artifact_connector_output.artifact_handles.items():
+                self._artifact_handles_by_req[req_id].extend(handles)
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1505,6 +1517,7 @@ class Scheduler(SchedulerInterface):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
+            artifact_transfer_params = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
@@ -1583,6 +1596,13 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    artifact_handles = self._artifact_handles_by_req.pop(req_id, None)
+                    if artifact_handles:
+                        artifact_transfer_params = {
+                            "version": 1,
+                            "backend": artifact_handles[0].get("backend"),
+                            "chunks": artifact_handles,
+                        }
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1621,6 +1641,7 @@ class Scheduler(SchedulerInterface):
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
+                        artifact_transfer_params=artifact_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,

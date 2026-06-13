@@ -37,6 +37,12 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.distributed.artifact_transfer import (
+    ArtifactConnectorOutput,
+    ArtifactTransferRequestConfig,
+    FileArtifactBackend,
+    get_artifact_transfer_config,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -637,6 +643,8 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        self._artifact_backends: dict[str, FileArtifactBackend] = {}
+        self._artifact_step_index_by_req: dict[str, int] = defaultdict(int)
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1136,6 +1144,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._artifact_step_index_by_req.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -3554,6 +3563,109 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    def _get_artifact_transfer_config(
+        self,
+        req_id: str,
+    ) -> ArtifactTransferRequestConfig | None:
+        request = self.requests.get(req_id)
+        if request is None or request.sampling_params is None:
+            return None
+        return get_artifact_transfer_config(request.sampling_params.extra_args)
+
+    def _get_artifact_backend(
+        self,
+        config: ArtifactTransferRequestConfig,
+    ) -> FileArtifactBackend:
+        backend = self._artifact_backends.get(config.path)
+        if backend is None:
+            backend = FileArtifactBackend(config.path)
+            self._artifact_backends[config.path] = backend
+        return backend
+
+    def _export_rollout_artifacts(
+        self,
+        req_ids: list[str],
+        valid_sampled_token_ids: list[list[int]],
+        logprobs_lists: LogprobsLists | None,
+        prompt_logprobs_dict: dict[str, LogprobsTensors | None],
+        invalid_req_indices: list[int],
+    ) -> tuple[ArtifactConnectorOutput | None, bool]:
+        configs = {
+            req_id: config
+            for req_id in req_ids
+            if (config := self._get_artifact_transfer_config(req_id)) is not None
+        }
+        if not configs:
+            return None, False
+
+        if self.use_async_scheduling:
+            logger.warning_once(
+                "Rollout artifact export is not supported with async scheduling "
+                "in this spike; skipping artifact export."
+            )
+            return None, False
+
+        invalid_req_indices_set = set(invalid_req_indices)
+        output = ArtifactConnectorOutput()
+        for req_idx, req_id in enumerate(req_ids):
+            if req_idx in invalid_req_indices_set:
+                continue
+            config = configs.get(req_id)
+            if config is None:
+                continue
+
+            fields = set(config.fields)
+            arrays: dict[str, Any] = {}
+            token_ids = (
+                valid_sampled_token_ids[req_idx]
+                if req_idx < len(valid_sampled_token_ids)
+                else []
+            )
+            if token_ids and "token_ids" in fields:
+                arrays["token_ids"] = np.asarray(token_ids, dtype=np.int64)
+
+            if token_ids and logprobs_lists is not None and "logprobs" in fields:
+                req_logprobs = logprobs_lists.slice_request(req_idx, len(token_ids))
+                arrays["logprob_token_ids"] = req_logprobs.logprob_token_ids
+                arrays["logprobs"] = req_logprobs.logprobs
+                arrays["sampled_token_ranks"] = req_logprobs.sampled_token_ranks
+
+            prompt_logprobs = prompt_logprobs_dict.get(req_id)
+            if prompt_logprobs is not None and "prompt_logprobs" in fields:
+                arrays["prompt_logprob_token_ids"] = (
+                    prompt_logprobs.logprob_token_ids.cpu().numpy()
+                )
+                arrays["prompt_logprobs"] = prompt_logprobs.logprobs.cpu().numpy()
+                arrays["prompt_sampled_token_ranks"] = (
+                    prompt_logprobs.selected_token_ranks.cpu().numpy()
+                )
+
+            if not arrays:
+                continue
+
+            step_index = self._artifact_step_index_by_req[req_id]
+            self._artifact_step_index_by_req[req_id] = step_index + 1
+            handle = self._get_artifact_backend(config).put_artifact(
+                request_id=req_id,
+                step_index=step_index,
+                arrays=arrays,
+                metadata={
+                    "format_version": 1,
+                    "exported_fields": sorted(arrays),
+                    "configured_fields": sorted(fields),
+                    "num_generated_tokens": len(token_ids),
+                },
+            )
+            output.artifact_handles.setdefault(req_id, []).append(handle.to_dict())
+
+        if output.is_empty():
+            return None, False
+
+        omit_logprobs_from_output = all(
+            config.exclude_from_request_output for config in configs.values()
+        ) and len(configs) == len(req_ids)
+        return output, omit_logprobs_from_output
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3566,6 +3678,7 @@ class GPUModelRunner(
         LogprobsLists | None,
         list[list[int]],
         dict[str, LogprobsTensors | None],
+        ArtifactConnectorOutput | None,
         list[str],
         dict[str, int],
         list[int],
@@ -3684,12 +3797,25 @@ class GPUModelRunner(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
+        artifact_connector_output, omit_logprobs_from_output = (
+            self._export_rollout_artifacts(
+                req_ids_output_copy,
+                valid_sampled_token_ids,
+                logprobs_lists,
+                prompt_logprobs_dict,
+                invalid_req_indices,
+            )
+        )
+        if omit_logprobs_from_output:
+            logprobs_lists = None
+            prompt_logprobs_dict = {}
 
         return (
             num_nans_in_logits,
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
+            artifact_connector_output,
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
@@ -4533,6 +4659,7 @@ class GPUModelRunner(
                 logprobs_lists,
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,
+                artifact_connector_output,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
@@ -4573,6 +4700,7 @@ class GPUModelRunner(
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
                 else None,
+                artifact_connector_output=artifact_connector_output,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
